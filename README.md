@@ -8,7 +8,7 @@ goToChannel(channel) - Tune to the requested channel. Channel must be an integer
 
 getChannel() - Returns the integer representation of the currently tuned channel. (as in goToChannel)
 
-seek(up) - Seeks in the requested direction. 1 = up, = Down.
+seek(up) - Seeks in the requested direction. 1 = up, 0 = Down. - Returns the channel it landed on.
 
 
 ## To Install this module:
