@@ -1,3 +1,14 @@
+/*
+Copyright 2021 Accutron Instruments Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+*/
+
 #include <python3.7/Python.h>
 #include <wiringPi.h>
 #include <wiringPiI2C.h>
@@ -45,6 +56,16 @@ uint16_t chip_regs[16];
 #define RDSS_BIT 11
 #define STEREO_BIT 8
 
+// RDS B Register
+#define GROUP_MASK 0xF000
+#define GROUP_OFFSET_BITS 12
+#define SUBGROUP_BIT 11
+#define TRAFFIC_BIT 10
+#define MUSIC_BIT 3
+#define POSITION_MASK 0x7
+
+
+
 static int I2C_FILE_DESCRIPTOR = -1;
 
 static void read_chip_registers(int fd)
@@ -81,22 +102,26 @@ static void write_chip_registers(int fd)
     // TODO: Check rc
 }
 
-static int read_channel(void)
+static int read_channel(int* stereo, int* rssi)
 {
     read_chip_registers(I2C_FILE_DESCRIPTOR);
     int channel = chip_regs[READCHAN] & 0x03FF; // Channel data is the lower 10 bits
     channel *= 2;
     channel += 875;
+    *stereo = chip_regs[STATUSRSSI] & (1 << STEREO_BIT);
+    *rssi = chip_regs[STATUSRSSI] & 0b01111111;
     return channel;
 }
 
-static get_rds_data()
+static void get_rds_data()
 {
     while (1)
     {
         read_chip_registers(I2C_FILE_DESCRIPTOR);
         if (chip_regs[STATUSRSSI] & (1 << RDSR_BIT))
         {
+            char oa_buffer[1024];
+            char twoa_buffer[1024];
 
             // uint16_t reg_a = (chip_regs[RDSA] & 0xFF00) >> 8;
             // reg_a |= (chip_regs[RDSA] & 0x00FF);
@@ -114,14 +139,29 @@ static get_rds_data()
             //Al = (chip_regs[RDSA] & 0x00FF);
 
             uint16_t b = chip_regs[RDSB];
-            uint16_t group = (b & 0xF000) >> 12;
-            int subgroup = (b & 0x800);
+            uint16_t group = (b & GROUP_MASK) >> GROUP_OFFSET_BITS;
+            int subgroup = (b & (1 << SUBGROUP_BIT)) >> SUBGROUP_BIT;
             char sg = subgroup == 0 ? 'A' : 'B';
 
-            int traffic = (b & 0b0000010000000000);
+            int traffic = (b & (1 << TRAFFIC_BIT)) >> TRAFFIC_BIT;
             uint16_t pty = (b & 0b0000001111100000) >> 5;
-            int music = (b & 0b0000000000001000);
-            uint16_t position = (b & 0b0000000000000111);
+            int music = (b & (1 << MUSIC_BIT)) >> MUSIC_BIT;
+            int position = (b & POSITION_MASK);
+
+            Dh = (chip_regs[RDSD] & 0xFF00) >> 8;
+            Dl = (chip_regs[RDSD] & 0x00FF);
+
+            if (group == 0 && subgroup == 0){
+                oa_buffer[position] = Dh;
+                oa_buffer[position + 1] = Dl;
+                printf("Group 0A Buffer: %s\n", oa_buffer);
+            }
+
+            if (group == 2 && subgroup == 0){
+                twoa_buffer[position] = Dh;
+                twoa_buffer[position + 1] = Dl;
+                printf("Group 2A Buffer: %s\n", twoa_buffer);
+            }
 
             Ch = (chip_regs[RDSC] & 0xFF00) >> 8;
             Cl = (chip_regs[RDSC] & 0x00FF);
@@ -140,7 +180,7 @@ static get_rds_data()
     }
 }
 
-static int go_to_channel(int channel)
+static int go_to_channel(int channel, int* stereo, int* rssi)
 {
     channel *= 10;
     channel -= 8750;
@@ -167,8 +207,8 @@ static int go_to_channel(int channel)
         read_chip_registers(I2C_FILE_DESCRIPTOR);
         if ((chip_regs[STATUSRSSI] & (1 << STC_BIT)) == 0)
             break;
-    }
-    int channel_data = read_channel();
+    }    
+    int channel_data = read_channel(stereo, rssi);
     return channel_data;
 }
 
@@ -227,7 +267,7 @@ static void initialize_chip()
     printf("Done\n");
 }
 
-static int seek(int dir){
+static int seek(int dir, int* stereo, int* rssi){
     read_chip_registers(I2C_FILE_DESCRIPTOR);
     // set seek wrap bit to disable
     chip_regs[POWERCFG] |= (1 << SEEKMODE_BIT);
@@ -244,13 +284,13 @@ static int seek(int dir){
     write_chip_registers(I2C_FILE_DESCRIPTOR);
     usleep(1000);
     read_chip_registers(I2C_FILE_DESCRIPTOR);
-    printf("Current STC: %d\n", chip_regs[STATUSRSSI] & (1 << STC_BIT));
+    printf("Current STC: %d\n", chip_regs[STATUSRSSI] & (1 << STC_BIT));    
     while (1)
     {
         read_chip_registers(I2C_FILE_DESCRIPTOR);
         if ((chip_regs[STATUSRSSI] & (1 << STC_BIT)) != 0)
             break; // seek is done
-        printf("Trying Station: %d\n", read_channel());
+        printf("Trying Station: %d\n", read_channel(stereo, rssi));
         //printf("Waiting on STC High After seek...\n");
     }
 
@@ -275,7 +315,7 @@ static int seek(int dir){
             break; // seek is done
         //printf("Waiting on STC Low After seek clear...\n");
     }
-    int channel_data = read_channel();
+    int channel_data = read_channel(stereo, rssi);
     return channel_data;
 }
 
@@ -303,8 +343,14 @@ static PyObject *method_go_to_channel(PyObject *self, PyObject *args)
     {
         return PyLong_FromLong(0);
     }
-    int channel_data = go_to_channel(channel);
-    return PyLong_FromLong(channel_data);
+    int stereo = 0;
+    int rssi = 0;
+    int channel_data = go_to_channel(channel, &stereo, &rssi);
+    PyObject* result = PyTuple_New(3);    
+    PyTuple_SetItem(result, 0, PyLong_FromLong(channel));
+    PyTuple_SetItem(result, 1, PyBool_FromLong(stereo));
+    PyTuple_SetItem(result, 2, PyLong_FromLong(rssi));
+    return result;
 }
 
 PyObject *method_seek(PyObject *self, PyObject *args)
@@ -314,14 +360,26 @@ PyObject *method_seek(PyObject *self, PyObject *args)
     {
         return PyBool_FromLong(0);
     }
-    
-    int cd = seek(dir);
-    return PyLong_FromLong(cd);
+    int stereo = 0;
+    int rssi = 0;
+    int channel = seek(dir, &stereo, &rssi);
+    PyObject* result = PyTuple_New(3);
+    PyTuple_SetItem(result, 0, PyLong_FromLong(channel));
+    PyTuple_SetItem(result, 1, PyBool_FromLong(stereo));
+    PyTuple_SetItem(result, 2, PyLong_FromLong(rssi));
+    return result;
 }
 
 static PyObject *method_getChannel(PyObject *self, PyObject *args)
 {
-    return PyLong_FromLong(read_channel());
+    int stereo = 0;
+    int rssi = 0;
+    PyObject* result = PyTuple_New(3);
+    int channel = read_channel(&stereo, &rssi);
+    PyTuple_SetItem(result, 0, PyLong_FromLong(channel));
+    PyTuple_SetItem(result, 1, PyBool_FromLong(stereo));
+    PyTuple_SetItem(result, 2, PyLong_FromLong(rssi));
+    return result;
 }
 
 static PyMethodDef Si4703Methods[] = {
