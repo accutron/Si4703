@@ -14,6 +14,9 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 #include <wiringPiI2C.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <string.h>
+
+static int rds_running = 0;
 
 // global array of register data
 uint16_t chip_regs[16];
@@ -55,6 +58,7 @@ uint16_t chip_regs[16];
 #define AFCRL_BIT 12
 #define RDSS_BIT 11
 #define STEREO_BIT 8
+#define BLERA 0x0600
 
 // RDS B Register
 #define GROUP_MASK 0xF000
@@ -63,10 +67,40 @@ uint16_t chip_regs[16];
 #define TRAFFIC_BIT 10
 #define MUSIC_BIT 3
 #define POSITION_MASK 0x7
+#define PTY_MASK 0x03E0
+#define PTY_OFFSET 5
 
+// READCHAN Register Bits
+#define BLERB 0xC000
+#define BLERC 0x3000
+#define BLERD 0x0C00
+#define RCHAN 0x03FF
 
+typedef enum
+{
+    false,
+    true
+} bool_t;
+
+typedef struct
+{
+    char program_service_name[9];
+    char radio_text[64 + 1];
+} rds_data_t;
+
+typedef struct
+{
+    bool_t station_name;
+    bool_t radio_text;
+} rds_status_t;
+
+static pthread_mutex_t rds_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t register_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t rds_thread_handle;
 
 static int I2C_FILE_DESCRIPTOR = -1;
+
+static char rds_output[9];
 
 static void read_chip_registers(int fd)
 {
@@ -75,7 +109,7 @@ static void read_chip_registers(int fd)
     int rc = read(fd, buffer, 32);
 
     //TODO: handle rc
-
+    pthread_mutex_lock(&register_mutex);
     for (int i = 0x0A, j = 0;; ++i, j += 2)
     {
         if (i == 0x10)
@@ -85,6 +119,7 @@ static void read_chip_registers(int fd)
         if (i == 0x09)
             break;
     }
+    pthread_mutex_unlock(&register_mutex);
 }
 
 static void write_chip_registers(int fd)
@@ -92,17 +127,19 @@ static void write_chip_registers(int fd)
     uint8_t write_buffer[12];
     // write sequence starts at address 0x02
     // only send the 0x02 - 0x07 control registers
+    pthread_mutex_lock(&register_mutex);
     for (int reg = 0x02, i = 0; reg < 0x08; ++reg, i += 2)
     {
         write_buffer[i] = chip_regs[reg] >> 8;
         write_buffer[i + 1] = chip_regs[reg] & 0x00FF;
     }
+    pthread_mutex_unlock(&register_mutex);
 
     int rc = write(fd, write_buffer, sizeof(write_buffer));
     // TODO: Check rc
 }
 
-static int read_channel(int* stereo, int* rssi)
+static int read_channel(int *stereo, int *rssi)
 {
     read_chip_registers(I2C_FILE_DESCRIPTOR);
     int channel = chip_regs[READCHAN] & 0x03FF; // Channel data is the lower 10 bits
@@ -113,74 +150,79 @@ static int read_channel(int* stereo, int* rssi)
     return channel;
 }
 
-static void get_rds_data()
+
+
+static void poll_rds_data()
 {
+    rds_data_t rds_data;
+    rds_status_t rds_status;
+
+    rds_status.radio_text = 0;
+    rds_status.station_name = 0;
+
+    // empty and null-terminate our string data
+    memset(rds_data.program_service_name, ' ', sizeof(rds_data.program_service_name));
+    memset(rds_data.radio_text, ' ', sizeof(rds_data.radio_text));
+    rds_data.program_service_name[sizeof(rds_data.program_service_name) - 1] = 0;
+    rds_data.radio_text[sizeof(rds_data.radio_text) - 1] = 0;
+
     while (1)
     {
         read_chip_registers(I2C_FILE_DESCRIPTOR);
         if (chip_regs[STATUSRSSI] & (1 << RDSR_BIT))
         {
-            char oa_buffer[1024];
-            char twoa_buffer[1024];
+            if ((((chip_regs[STATUSRSSI] & BLERA) >> 9) < 3) &&
+                (((chip_regs[READCHAN] & BLERB) >> 14) < 3) &&
+                (((chip_regs[READCHAN] & BLERC) >> 12) < 3) &&
+                ((chip_regs[READCHAN] & BLERA) >> 10) < 3)
+            {                
 
-            // uint16_t reg_a = (chip_regs[RDSA] & 0xFF00) >> 8;
-            // reg_a |= (chip_regs[RDSA] & 0x00FF);
+                uint16_t b = chip_regs[RDSB];
+                uint16_t group = (b & GROUP_MASK) >> GROUP_OFFSET_BITS;
+                int subgroup = (b & (1 << SUBGROUP_BIT)) >> SUBGROUP_BIT;
+                char sg = subgroup == 0 ? 'A' : 'B';
 
-            // uint16_t reg_b = (chip_regs[RDSB] & 0xFF00) >> 8;
-            // reg_b |= (chip_regs[RDSB] & 0x00FF);
+                int traffic = (b & (1 << TRAFFIC_BIT)) >> TRAFFIC_BIT;
+                uint16_t pty = (b & PTY_MASK) >> PTY_OFFSET;
+                int music = (b & (1 << MUSIC_BIT)) >> MUSIC_BIT;
+                int position = (b & POSITION_MASK);
+                
 
-            // uint16_t reg_c = (chip_regs[RDSC] & 0xFF00) >> 8;
-            // reg_c |= (chip_regs[RDSC] & 0x00FF);
+                if (group == 0)
+                {
+                    int idx = (chip_regs[RDSB] & 0x03);
 
-            // uint16_t reg_d = (chip_regs[RDSD] & 0xFF00) >> 8;
-            // reg_d |= (chip_regs[RDSD] & 0x00FF);
-            char Ah, Al, Bh, Bl, Ch, Cl, Dh, Dl;
-            //Ah = (chip_regs[RDSA] & 0xFF00) >> 8;
-            //Al = (chip_regs[RDSA] & 0x00FF);
+                    char ch = chip_regs[RDSD] >> 8;
+                    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') || ch == '.' || ch == ' ')
+                    {
+                        rds_data.program_service_name[idx * 2] = ch;
+                    }
+                    ch = chip_regs[RDSD] & 0xFF;
+                    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') || ch == '.' || ch == ' ')
+                    {
+                        rds_data.program_service_name[idx * 2 + 1] = ch;
+                    }
+                }
 
-            uint16_t b = chip_regs[RDSB];
-            uint16_t group = (b & GROUP_MASK) >> GROUP_OFFSET_BITS;
-            int subgroup = (b & (1 << SUBGROUP_BIT)) >> SUBGROUP_BIT;
-            char sg = subgroup == 0 ? 'A' : 'B';
-
-            int traffic = (b & (1 << TRAFFIC_BIT)) >> TRAFFIC_BIT;
-            uint16_t pty = (b & 0b0000001111100000) >> 5;
-            int music = (b & (1 << MUSIC_BIT)) >> MUSIC_BIT;
-            int position = (b & POSITION_MASK);
-
-            Dh = (chip_regs[RDSD] & 0xFF00) >> 8;
-            Dl = (chip_regs[RDSD] & 0x00FF);
-
-            if (group == 0 && subgroup == 0){
-                oa_buffer[position] = Dh;
-                oa_buffer[position + 1] = Dl;
-                printf("Group 0A Buffer: %s\n", oa_buffer);
+                pthread_mutex_lock(&rds_mutex);
+                memcpy(rds_output, rds_data.program_service_name, sizeof(rds_data.program_service_name));
+                //printf("\rProgram Service Name: %s", rds_output);
+                pthread_mutex_unlock(&rds_mutex);
+                
+                
             }
-
-            if (group == 2 && subgroup == 0){
-                twoa_buffer[position] = Dh;
-                twoa_buffer[position + 1] = Dl;
-                printf("Group 2A Buffer: %s\n", twoa_buffer);
-            }
-
-            Ch = (chip_regs[RDSC] & 0xFF00) >> 8;
-            Cl = (chip_regs[RDSC] & 0x00FF);
-
-            Dh = (chip_regs[RDSD] & 0xFF00) >> 8;
-            Dl = (chip_regs[RDSD] & 0x00FF);
-
-            //printf("RDS Packet: %#x %#x %#x %#x\n", reg_a, reg_b, reg_c, reg_d);
-            printf("RDS Packet: Raw %4x Group: %2x%c Traffic: %d PTY: %d Music/Speech: %d Position: %d %c %c\n", b, group, sg, traffic, pty, music, position, Dh, Dl);
-            usleep(1000 * 40);
+            usleep(1000 * 50);
         }
         else
         {
-            usleep(1000 * 20);
+            usleep(1000 * 30);
         }
     }
 }
 
-static int go_to_channel(int channel, int* stereo, int* rssi)
+static int go_to_channel(int channel, int *stereo, int *rssi)
 {
     channel *= 10;
     channel -= 8750;
@@ -207,15 +249,14 @@ static int go_to_channel(int channel, int* stereo, int* rssi)
         read_chip_registers(I2C_FILE_DESCRIPTOR);
         if ((chip_regs[STATUSRSSI] & (1 << STC_BIT)) == 0)
             break;
-    }    
+    }
     int channel_data = read_channel(stereo, rssi);
     return channel_data;
 }
 
-
-
 static void initialize_chip()
 {
+
     printf("Initializing...\n");
     wiringPiSetupGpio(); // Use BCM Numbers
 
@@ -267,31 +308,29 @@ static void initialize_chip()
     printf("Done\n");
 }
 
-static int seek(int dir, int* stereo, int* rssi){
+static int seek(int dir, int *stereo, int *rssi)
+{
     read_chip_registers(I2C_FILE_DESCRIPTOR);
     // set seek wrap bit to disable
     chip_regs[POWERCFG] |= (1 << SEEKMODE_BIT);
     if (dir == 0) // seek down
     {
-        // unset seek up in powercfg        
+        // unset seek up in powercfg
         chip_regs[POWERCFG] &= ~(1 << SEEKUP_BIT);
     }
     else
-    {        
+    {
         chip_regs[POWERCFG] |= (1 << SEEKUP_BIT);
     }
-    chip_regs[POWERCFG] |= (1 << SEEK_BIT);    
+    chip_regs[POWERCFG] |= (1 << SEEK_BIT);
     write_chip_registers(I2C_FILE_DESCRIPTOR);
-    usleep(1000);
-    read_chip_registers(I2C_FILE_DESCRIPTOR);
-    printf("Current STC: %d\n", chip_regs[STATUSRSSI] & (1 << STC_BIT));    
+    usleep(1000);        
     while (1)
     {
         read_chip_registers(I2C_FILE_DESCRIPTOR);
         if ((chip_regs[STATUSRSSI] & (1 << STC_BIT)) != 0)
             break; // seek is done
-        printf("Trying Station: %d\n", read_channel(stereo, rssi));
-        //printf("Waiting on STC High After seek...\n");
+        printf("Trying Station: %d\n", read_channel(stereo, rssi));        
     }
 
     // see if we hit the band limit
@@ -304,9 +343,8 @@ static int seek(int dir, int* stereo, int* rssi){
     // need to unset SEEK
     chip_regs[POWERCFG] &= ~(1 << SEEK_BIT);
     write_chip_registers(I2C_FILE_DESCRIPTOR);
-    
-    usleep(1000);
-    read_chip_registers(I2C_FILE_DESCRIPTOR);    
+
+    usleep(1000);    
     // wait on STC Clear
     while (1)
     {
@@ -327,8 +365,15 @@ static PyObject *method_initialize_chip(PyObject *self, PyObject *args)
 
 PyObject *method_readRDS(PyObject *self, PyObject *args)
 {
-    get_rds_data();
-    return PyLong_FromLong(0);
+    if (!rds_running){
+        rds_running = true;
+        int rc = pthread_create(&rds_thread_handle, NULL, poll_rds_data, NULL);
+        pthread_detach(rds_thread_handle);
+    }    
+    pthread_mutex_lock(&rds_mutex);
+    PyObject* result = PyUnicode_Decode(rds_output, sizeof(rds_output), "ascii", "ignore");
+    pthread_mutex_unlock(&rds_mutex);
+    return result;
 }
 
 static PyObject *method_go_to_channel(PyObject *self, PyObject *args)
@@ -346,7 +391,7 @@ static PyObject *method_go_to_channel(PyObject *self, PyObject *args)
     int stereo = 0;
     int rssi = 0;
     int channel_data = go_to_channel(channel, &stereo, &rssi);
-    PyObject* result = PyTuple_New(3);    
+    PyObject *result = PyTuple_New(3);
     PyTuple_SetItem(result, 0, PyLong_FromLong(channel));
     PyTuple_SetItem(result, 1, PyBool_FromLong(stereo));
     PyTuple_SetItem(result, 2, PyLong_FromLong(rssi));
@@ -363,7 +408,7 @@ PyObject *method_seek(PyObject *self, PyObject *args)
     int stereo = 0;
     int rssi = 0;
     int channel = seek(dir, &stereo, &rssi);
-    PyObject* result = PyTuple_New(3);
+    PyObject *result = PyTuple_New(3);
     PyTuple_SetItem(result, 0, PyLong_FromLong(channel));
     PyTuple_SetItem(result, 1, PyBool_FromLong(stereo));
     PyTuple_SetItem(result, 2, PyLong_FromLong(rssi));
@@ -374,7 +419,7 @@ static PyObject *method_getChannel(PyObject *self, PyObject *args)
 {
     int stereo = 0;
     int rssi = 0;
-    PyObject* result = PyTuple_New(3);
+    PyObject *result = PyTuple_New(3);
     int channel = read_channel(&stereo, &rssi);
     PyTuple_SetItem(result, 0, PyLong_FromLong(channel));
     PyTuple_SetItem(result, 1, PyBool_FromLong(stereo));
